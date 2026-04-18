@@ -1,0 +1,4 @@
+credential.txt
+*.env
+.env
+.env.*
