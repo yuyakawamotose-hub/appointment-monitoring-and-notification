@@ -1,4 +1,4 @@
-credential.txt
-*.env
-.env
-.env.*
+# Track only n8n-workflow.json (and this file). Ignore everything else.
+*
+!.gitignore
+!n8n-workflow.json
