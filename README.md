@@ -1,141 +1,123 @@
-# 営業アシスタント — 朝のアポ情報自動収集と通知
+# Sales assistant — morning appointment intel and notifications
 
-`n8n-workflow.json` が定義するワークフローの処理の流れです。ワークフロー名は **「営業アシスタント - 朝のアポ情報自動収集と通知 (Step 1-2: トリガー・データ取得)」** です。
+This document describes the flow implemented in `n8n-workflow.json`. The workflow title in n8n is **「営業アシスタント - 朝のアポ情報自動収集と通知 (Step 1-2: トリガー・データ取得)」** (Japanese).
 
-## 概要
+## Overview
 
-毎朝スケジュール実行し、その日の **Google カレンダー** の予定を取得します。予定の説明文に **「会社名」** が含まれる案件だけを対象に、**会社名を AI で抽出** → **Web 検索で公式サイトを特定** → **サイト内の複数ページを取得して要約** → **Google スプレッドシートに1行追記** → **Slack と Gmail で営業担当向けの応援メッセージを通知** します。
+Runs on a morning schedule, loads that day’s events from **Google Calendar**, and only continues for items whose description contains the literal text **「会社名」** (company name marker). It then **extracts the counterparty company name with AI**, **finds the corporate site via web search**, **fetches and summarizes multiple pages**, **appends one row to Google Sheets**, and sends an internal **cheer-up message via Slack and Gmail**.
 
-## 前提（ワークフロー内で使う連携）
+## Integrations (credentials expected on nodes)
 
-次の認証情報がノードに紐づいている想定です（実際の ID／アカウント名はインポート後に差し替えてください）。
+Replace credential IDs / account names after import as needed.
 
-| 用途 | ノード例 |
-|------|-----------|
-| Google カレンダー | `今日の予定を取得` |
-| Google スプレッドシート | `Append row in sheet` |
+| Purpose | Example nodes |
+|--------|------------------|
+| Google Calendar | `今日の予定を取得` |
+| Google Sheets | `Append row in sheet` |
 | Gmail | `Send a message1` |
 | Slack | `Send a message` |
-| SerpApi（Google 検索） | `Google search` / `Google search1` |
-| OpenAI API | `Message a model` ほか複数 |
-| Google Gemini API | `予定の詳細から会社名を取得1` ほか |
+| SerpApi (Google search) | `Google search` / `Google search1` |
+| OpenAI API | Several `Message a model*` nodes |
+| Google Gemini API | `予定の詳細から会社名を取得1` and others |
 
-タイムゾーンは **Asia/Tokyo**、カレンダー取得は **その日の 0:00〜23:59** を境界にしています。
+Timezone is **Asia/Tokyo**. Calendar window is **start/end of that local calendar day** (`start` / `end` ISO fields).
 
-## フロー全体（接続されているメイン経路）
+## End-to-end flow (connected main path)
 
 ```mermaid
 flowchart LR
-  A[実行スケジュールを設定] --> B[実行日を設定]
-  B --> C[今日の予定を取得]
-  C --> D[予定の詳細から会社名を取得 IF]
-  D --> E[Message a model3 会社名抽出 GPT]
-  E --> F[Google search]
-  F --> G[HTTP Request トップページ取得]
-  G --> H[Message a model ページ一覧 JSON]
-  H --> I[Code in JavaScript 一覧を分割]
-  I --> J[HTTP Request1 各URL取得]
-  J --> K[Aggregate HTML結合]
-  K --> L[Message a model4 会社情報 JSON]
-  L --> M[Code in JavaScript1 行データ化]
-  M --> N[Append row in sheet]
-  N --> O[Message a model5 通知文生成]
-  O --> P[Code in JavaScript4 JSON分割]
-  P --> Q[Send a message Slack]
-  P --> R[Send a message1 Gmail]
+  A[Cron 実行スケジュールを設定] --> B[Set 実行日を設定]
+  B --> C[Google Calendar 今日の予定を取得]
+  C --> D[If 予定の詳細から会社名を取得]
+  D --> E[OpenAI Message a model3 company name]
+  E --> F[SerpApi Google search]
+  F --> G[HTTP Request top page]
+  G --> H[OpenAI Message a model page map JSON]
+  H --> I[Code split pages]
+  I --> J[HTTP Request1 fetch each URL]
+  J --> K[Aggregate merge HTML]
+  K --> L[OpenAI Message a model4 company JSON]
+  L --> M[Code in JavaScript1 row values]
+  M --> N[Sheets Append row in sheet]
+  N --> O[OpenAI Message a model5 notifications]
+  O --> P[Code in JavaScript4 parse JSON]
+  P --> Q[Slack Send a message]
+  P --> R[Gmail Send a message1]
 ```
 
-## ステップ別の説明
+## Step-by-step
 
-### 1. トリガーと実行日
+### 1. Trigger and run date
 
-1. **`実行スケジュールを設定`（Cron）**  
-   毎日 **7:00** に実行（ワークフロー内設定）。
+1. **`実行スケジュールを設定` (Cron)** — fires every day at **07:00** (as configured in the workflow).
 
-2. **`実行日を設定`（Set）**  
-   実行時点の **日本時間でその日の開始・終了**（`start` / `end`）を ISO 形式で設定。カレンダー検索の `timeMin` / `timeMax` に使用。
+2. **`実行日を設定` (Set)** — sets **`start`** and **`end`** for **that day in Japan time** (ISO strings), used as `timeMin` / `timeMax` for Calendar.
 
-### 2. カレンダー取得とフィルタ
+### 2. Calendar fetch and filter
 
-3. **`今日の予定を取得`（Google Calendar）**  
-   指定カレンダーから、`start`〜`end` のイベントを **すべて取得**（開始時刻順などオプションあり）。
+3. **`今日の予定を取得` (Google Calendar)** — loads **all** events between `start` and `end` for the chosen calendar (ordering options set on the node).
 
-4. **`予定の詳細から会社名を取得`（If）**  
-   各イベントについて次を **両方**満たす場合のみ後続へ進みます（Sticky Note の説明と一致）。  
-   - 説明文（`description`）が **空ではない**  
-   - 説明文に **「会社名」という文字列が含まれる**  
+4. **`予定の詳細から会社名を取得` (If)** — for each item, continues only if **both** hold (matches the Sticky Note intent):  
+   - Event **`description` is not empty**  
+   - **`description` contains the substring 「会社名」**  
 
-   条件を満たさない予定はこの分岐では処理されません（IF の false 側はこの JSON では後続ノードに接続されていません）。
+   Events that fail the check are not processed on this branch (the **false** output has **no downstream nodes** in this JSON export).
 
-### 3. 会社名の特定と検索
+### 3. Resolve company name and search
 
-5. **`Message a model3`（OpenAI）**  
-   予定の **説明文から商談先の会社名を1つだけ** 抽出するプロンプト（見つからない場合は「不明」）。
+5. **`Message a model3` (OpenAI)** — extracts **one** counterparty company name from the description (or “不明” if none).
 
-6. **`Google search`（SerpApi）**  
-   抽出した会社名をクエリに **Google 検索**（上位1件を利用する想定）。
+6. **`Google search` (SerpApi)** — runs a **Google search** using that string (expects to use the top organic result downstream).
 
-7. **`HTTP Request`**  
-   検索結果の **先頭オーガニック結果の URL** に GET し、企業サイトの **トップページ HTML** を取得。
+7. **`HTTP Request`** — **GET** the **first organic result URL** and download the site **homepage HTML**.
 
-### 4. サイト内ページの列挙と取得
+### 4. Map site pages and fetch them
 
-8. **`Message a model`（OpenAI）**  
-   トップページ HTML を解析し、**同一ドメイン内の主要ページ**について「画面名 → 絶対 URL」の **JSON オブジェクトだけ** を返すよう指示（`mailto:` 等は除外）。
+8. **`Message a model` (OpenAI)** — analyzes homepage HTML and returns **only** a JSON object mapping **human-readable page labels → absolute URLs**, same domain only; excludes `mailto:`, `tel:`, etc.
 
-9. **`Code in JavaScript`**  
-   モデル出力の JSON をパースし、**各 `{ label, url }` をアイテムに分割**（複数ページを並列処理するため）。
+9. **`Code in JavaScript`** — parses that JSON and **splits** it into **one item per `{ label, url }`** for parallel fetches.
 
-10. **`HTTP Request1`**  
-    各 URL に GET。**リダイレクトは追従しない** 設定。エラー時は `continueErrorOutput` で失敗分支も扱える構成。
+10. **`HTTP Request1`** — **GET** each URL; **redirects are not followed**. Uses **`continueErrorOutput`** so failures can be handled on an error branch.
 
-11. **`Aggregate`**  
-    取得した HTML などから **`data` フィールドを集約**（後段のモデルにまとめて渡すため）。
+11. **`Aggregate`** — aggregates the **`data`** field so the next model receives **combined HTML**.
 
-### 5. 会社情報の要約とスプレッドシート反映
+### 5. Summarize company info and write Sheets
 
-12. **`Message a model4`（OpenAI）**  
-    集約された HTML を入力に、**会社名・社員数・所在地・電話・事業内容・注目箇所（配列）** の固定キー JSON を出力。
+12. **`Message a model4` (OpenAI)** — from the merged HTML, outputs a fixed-schema JSON: **company name, headcount, address, phone, business summary, highlights (array)**.
 
-13. **`Code in JavaScript1`**  
-    上記 JSON を、スプレッドシートの列順に合わせて **1行分の配列 `values`** に整形（「注目箇所」は配列を箇条書きテキストに変換）。
+13. **`Code in JavaScript1`** — maps that JSON into a **single row array `values`** matching sheet column order (bullet-list text for the highlights array).
 
-14. **`Append row in sheet`（Google Sheets）**  
-    スプレッドシート「今日のアポ予定」のシート **「アポ一覧」** に **行を追記**（列マッピングはノード内定義）。
+14. **`Append row in sheet` (Google Sheets)** — appends to the spreadsheet **「今日のアポ予定」**, sheet **「アポ一覧」** (mapping defined on the node).
 
-### 6. 通知（Slack / Gmail）
+### 6. Notifications (Slack / Gmail)
 
-15. **`Message a model5`（OpenAI）**  
-    追記した行の会社情報を参照し、社内向けに **Slack 用テキスト** と **メール用 HTML** を **1つの JSON**（`slack_text`, `email_html`）で生成。構成は「今日のアポ先のポイント」「事前に押さえておきたい情報」「ひと言応援コメント」の3ブロック。
+15. **`Message a model5` (OpenAI)** — builds **one JSON** with **`slack_text`** and **`email_html`** for internal sales staff, with three sections: **today’s meeting highlights**, **what to double-check beforehand**, and **a short cheer message**.
 
-16. **`Code in JavaScript4`**  
-    モデル出力から **`slack_text` と `email_html` をパース**して後続ノード用に渡す。
+16. **`Code in JavaScript4`** — parses model output into **`slack_text`** and **`email_html`** for downstream nodes.
 
-17. **`Send a message`（Slack）**  
-    指定チャンネルに **`slack_text`** を投稿。
+17. **`Send a message` (Slack)** — posts **`slack_text`** to the configured channel.
 
-18. **`Send a message1`（Gmail）**  
-    設定された宛先に **件名「本日のアポイントメント」** で **`email_html`** を送信。
+18. **`Send a message1` (Gmail)** — sends **`email_html`** with subject **「本日のアポイントメント」** to the configured recipient.
 
 ---
 
-## キャンバス上のメモ（Sticky Note）
+## Sticky notes on the canvas
 
-| メモ | 内容の要約 |
-|------|------------|
-| Sticky Note | 実行日のイベントをカレンダーから取得。**イベントが0件**、または説明に「会社名」が書かれたイベントが **1件も無い** と処理対象にならない、という説明。 |
-| Sticky Note2 | 会社サイトを取得し、**全画面の URL を取得**するブロックの説明。 |
-| Sticky Note3 | **全画面の情報をまとめて分析・要約**するブロックの説明。 |
-| Sticky Note4 | **要約を構造化してスプレッドシートに追加**するブロックの説明。 |
-| Sticky Note5 | **通知メッセージを作成し、ツール別に通知**するブロックの説明。 |
+| Note | Summary |
+|------|---------|
+| Sticky Note | Explains calendar fetch: if **no events**, or **no** event description contains 「会社名」, nothing useful runs for this path. |
+| Sticky Note2 | Block for **fetching the corporate site and collecting page URLs**. |
+| Sticky Note3 | Block for **merging all page content and analyzing / summarizing**. |
+| Sticky Note4 | Block for **structuring the summary and appending to the spreadsheet**. |
+| Sticky Note5 | Block for **drafting notification copy and sending via each tool**. |
 
-## Gemini 版のノード（別系統・エクスポートでは未接続あり）
+## Gemini alternative nodes (partially unwired in export)
 
-同じ業務を **Google Gemini** で実装したノード群（`予定の詳細から会社名を取得1`、`Google search1`、`Message a model1`、`Message a model2`、`Message a model6`、`Code in JavaScript2` / `Code in JavaScript3` など）が JSON に含まれていますが、**このファイルの `connections` だけを見ると、メイン経路とは線がつながっていない／途中で切れている部分**があります。エディタ上で分岐として使う予定だった可能性があります。利用する場合は n8n 上で **接続を確認・完成させる**か、不要なら削除してください。
+The JSON also contains **Google Gemini** variants (`予定の詳細から会社名を取得1`, `Google search1`, `Message a model1`, `Message a model2`, `Message a model6`, `Code in JavaScript2` / `Code in JavaScript3`, etc.). In **`connections` alone**, some of these are **not linked to the main path** or **stop mid-chain**. They may be experimental branches—**finish wiring in n8n** or **remove** if unused.
 
-また、`Code in JavaScript3` のコードは **`JSON.parse(...)` の閉じ括弧が欠けている**ように見えるため、そのままでは実行エラーになり得ます。インポート後にコードノードを開いて修正してください。
+`Code in JavaScript3` appears to have a **missing closing parenthesis** on `JSON.parse(...)` and may throw at runtime until fixed in the Code node.
 
-## 運用上のメモ
+## Operations
 
-- ワークフローの **`active` はエクスポート時点で false** です。本番運用前にスケジュールと認証を確認し、必要なら有効化してください。
-- `n8n-workflow.json` には **スプレッドシート ID・メールアドレス・チャンネル名** などが含まれる場合があります。公開リポジトリでは値をマスクするか、環境変数／認証情報で管理する運用を推奨します。
+- Workflow **`active` is `false`** in the exported file. Validate schedule and credentials before activating.
+- `n8n-workflow.json` may embed **spreadsheet IDs, emails, channel names**, etc. For public repos, redact or move secrets to credentials / env vars.
